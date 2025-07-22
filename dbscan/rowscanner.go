@@ -132,17 +132,26 @@ func (*noOpScanType) Scan(value interface{}) error {
 	return nil
 }
 
+type nestedGroup struct {
+	prefix       string
+	fieldIndexes []int // Indexes of columns related to this nested structure
+	scanValues   []*sql.NullString
+	children     map[string]*nestedGroup
+}
+
 func (rs *RowScanner) scanStruct(structValue reflect.Value) error {
 	if rs.scans == nil {
 		rs.scans = make([]interface{}, len(rs.columns))
 	}
 
-	// Map: the key is the path to the structure (for example, "AgentDetails"), the value is a list of field indexes
-	nestedFields := map[string][]int{}
-	// Map: key — path, value — temporary values that will be scanned for NULL verification
-	nestedScans := map[string][]*sql.NullString{}
+	rootGroup := &nestedGroup{
+		prefix:       "",
+		fieldIndexes: []int{},
+		scanValues:   []*sql.NullString{},
+		children:     map[string]*nestedGroup{},
+	}
 
-	// First pass: for nested structures, we collect the fields separately
+	// Let's build a tree of nested structures
 	for i, column := range rs.columns {
 		fieldIndex, ok := rs.columnToFieldIndex[column]
 		if !ok {
@@ -157,62 +166,118 @@ func (rs *RowScanner) scanStruct(structValue reflect.Value) error {
 			)
 		}
 
-		// Define the prefix of the nested structure (if any)
-		prefix := column
-		if idx := strings.Index(column, "."); idx != -1 {
-			prefix = column[:idx]
-		}
-
-		// For nested structures, scan to sql.NullString temporarily
-		if prefix != column {
-			// This is a nested structure
-			nestedFields[prefix] = append(nestedFields[prefix], i)
-			if _, ok := nestedScans[prefix]; !ok {
-				nestedScans[prefix] = make([]*sql.NullString, 0)
-			}
-			tmp := new(sql.NullString)
-			nestedScans[prefix] = append(nestedScans[prefix], tmp)
-			rs.scans[i] = tmp
-		} else {
-			// The usual top-level field
+		parts := strings.Split(column, ".")
+		if len(parts) == 1 {
+			// top-level field
 			initializeNested(structValue, fieldIndex)
 			fieldVal := structValue.FieldByIndex(fieldIndex)
 			rs.scans[i] = fieldVal.Addr().Interface()
+			continue
 		}
+
+		// nested fields
+		group := rootGroup
+		for _, part := range parts[:len(parts)-1] {
+			if group.children[part] == nil {
+				group.children[part] = &nestedGroup{
+					prefix:       part,
+					fieldIndexes: []int{},
+					scanValues:   []*sql.NullString{},
+					children:     map[string]*nestedGroup{},
+				}
+			}
+			group = group.children[part]
+		}
+		group.fieldIndexes = append(group.fieldIndexes, i)
+		tmp := new(sql.NullString)
+		group.scanValues = append(group.scanValues, tmp)
+		rs.scans[i] = tmp
 	}
 
-	// We scan to the prepared locations
+	// The first scan is in sql.NullString
 	if err := rs.rows.Scan(rs.scans...); err != nil {
-		return fmt.Errorf("scany: scan row into struct fields: %w", err)
+		return fmt.Errorf("scany: scan row into temp values: %w", err)
 	}
 
-	// Second pass: check the nested structures
-	for prefix, scanVals := range nestedScans {
+	// Recursively traversing the tree and initializing structures if at least one field is not NULL
+	var applyNested func(g *nestedGroup, parent reflect.Value, path []string)
+	applyNested = func(g *nestedGroup, parent reflect.Value, path []string) {
 		allNull := true
-		for _, val := range scanVals {
+		for _, val := range g.scanValues {
 			if val.Valid {
 				allNull = false
 				break
 			}
 		}
+		for _, child := range g.children {
+			applyNested(child, parent, append(path, child.prefix))
+			// If at least one child object is not null → the current one is also not null
+			allNull = allNull && isGroupAllNull(child)
+		}
+
 		if allNull {
-			// the structure remains nil
-			continue
+			return
 		}
-		// Initializing the nested structure
-		for _, i := range nestedFields[prefix] {
-			fieldIndex := rs.columnToFieldIndex[rs.columns[i]]
+
+		// Initializing the nested fields
+		fieldVal := parent
+		if len(path) > 0 {
+			for _, p := range path[1:] { // пропускаем корень
+				fieldVal = dereferenceAndGetField(fieldVal, p)
+				if !fieldVal.IsValid() {
+					return
+				}
+			}
+		}
+
+		for _, idx := range g.fieldIndexes {
+			fieldIndex := rs.columnToFieldIndex[rs.columns[idx]]
 			initializeNested(structValue, fieldIndex)
-			fieldVal := structValue.FieldByIndex(fieldIndex)
-			rs.scans[i] = fieldVal.Addr().Interface()
-		}
-		// We re-scan only the nested fields with the correct link.
-		if err := rs.rows.Scan(rs.scans...); err != nil {
-			return fmt.Errorf("scany: rescan nested struct: %w", err)
+			destField := structValue.FieldByIndex(fieldIndex)
+			rs.scans[idx] = destField.Addr().Interface()
 		}
 	}
 
+	applyNested(rootGroup, structValue, []string{""})
+
+	// Repeat scan — in real fields
+	if err := rs.rows.Scan(rs.scans...); err != nil {
+		return fmt.Errorf("scany: final scan into struct: %w", err)
+	}
+
 	return nil
+}
+
+func isGroupAllNull(g *nestedGroup) bool {
+	for _, v := range g.scanValues {
+		if v.Valid {
+			return false
+		}
+	}
+	for _, child := range g.children {
+		if !isGroupAllNull(child) {
+			return false
+		}
+	}
+	return true
+}
+
+func dereferenceAndGetField(v reflect.Value, fieldName string) reflect.Value {
+	v = reflect.Indirect(v)
+	if v.Kind() != reflect.Struct {
+		return reflect.Value{}
+	}
+	field := v.FieldByNameFunc(func(s string) bool {
+		return strings.EqualFold(s, fieldName)
+	})
+	if !field.IsValid() {
+		return reflect.Value{}
+	}
+	// initialize if nil
+	if field.Kind() == reflect.Ptr && field.IsNil() {
+		field.Set(reflect.New(field.Type().Elem()))
+	}
+	return reflect.Indirect(field)
 }
 
 func (rs *RowScanner) scanMap(mapValue reflect.Value) error {
