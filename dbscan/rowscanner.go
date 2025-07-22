@@ -1,8 +1,10 @@
 package dbscan
 
 import (
+	"database/sql"
 	"fmt"
 	"reflect"
+	"strings"
 )
 
 type startScannerFunc func(rs *RowScanner, dstValue reflect.Value) error
@@ -134,6 +136,13 @@ func (rs *RowScanner) scanStruct(structValue reflect.Value) error {
 	if rs.scans == nil {
 		rs.scans = make([]interface{}, len(rs.columns))
 	}
+
+	// Map: the key is the path to the structure (for example, "AgentDetails"), the value is a list of field indexes
+	nestedFields := map[string][]int{}
+	// Map: key — path, value — temporary values that will be scanned for NULL verification
+	nestedScans := map[string][]*sql.NullString{}
+
+	// First pass: for nested structures, we collect the fields separately
 	for i, column := range rs.columns {
 		fieldIndex, ok := rs.columnToFieldIndex[column]
 		if !ok {
@@ -147,17 +156,62 @@ func (rs *RowScanner) scanStruct(structValue reflect.Value) error {
 				column, structValue.Type(),
 			)
 		}
-		// Struct may contain embedded structs by ptr that defaults to nil.
-		// In order to scan values into a nested field,
-		// we need to initialize all nil structs on its way.
-		initializeNested(structValue, fieldIndex)
 
-		fieldVal := structValue.FieldByIndex(fieldIndex)
-		rs.scans[i] = fieldVal.Addr().Interface()
+		// Define the prefix of the nested structure (if any)
+		prefix := column
+		if idx := strings.Index(column, "."); idx != -1 {
+			prefix = column[:idx]
+		}
+
+		// For nested structures, scan to sql.NullString temporarily
+		if prefix != column {
+			// This is a nested structure
+			nestedFields[prefix] = append(nestedFields[prefix], i)
+			if _, ok := nestedScans[prefix]; !ok {
+				nestedScans[prefix] = make([]*sql.NullString, 0)
+			}
+			tmp := new(sql.NullString)
+			nestedScans[prefix] = append(nestedScans[prefix], tmp)
+			rs.scans[i] = tmp
+		} else {
+			// The usual top-level field
+			initializeNested(structValue, fieldIndex)
+			fieldVal := structValue.FieldByIndex(fieldIndex)
+			rs.scans[i] = fieldVal.Addr().Interface()
+		}
 	}
+
+	// We scan to the prepared locations
 	if err := rs.rows.Scan(rs.scans...); err != nil {
 		return fmt.Errorf("scany: scan row into struct fields: %w", err)
 	}
+
+	// Second pass: check the nested structures
+	for prefix, scanVals := range nestedScans {
+		allNull := true
+		for _, val := range scanVals {
+			if val.Valid {
+				allNull = false
+				break
+			}
+		}
+		if allNull {
+			// the structure remains nil
+			continue
+		}
+		// Initializing the nested structure
+		for _, i := range nestedFields[prefix] {
+			fieldIndex := rs.columnToFieldIndex[rs.columns[i]]
+			initializeNested(structValue, fieldIndex)
+			fieldVal := structValue.FieldByIndex(fieldIndex)
+			rs.scans[i] = fieldVal.Addr().Interface()
+		}
+		// We re-scan only the nested fields with the correct link.
+		if err := rs.rows.Scan(rs.scans...); err != nil {
+			return fmt.Errorf("scany: rescan nested struct: %w", err)
+		}
+	}
+
 	return nil
 }
 
