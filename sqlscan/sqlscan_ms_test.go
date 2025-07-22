@@ -9,7 +9,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/georgysavva/scany/v2/sqlscan"
+	"github.com/darkfoxs96/scany/v2/sqlscan"
 	_ "github.com/microsoft/go-mssqldb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

@@ -47,7 +47,7 @@ import (
 	"context"
 	"database/sql"
 
-	"github.com/georgysavva/scany/v2/sqlscan"
+	"github.com/darkfoxs96/scany/v2/sqlscan"
 )
 
 type User struct {
@@ -80,7 +80,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/georgysavva/scany/v2/pgxscan"
+	"github.com/darkfoxs96/scany/v2/pgxscan"
 )
 
 type User struct {
